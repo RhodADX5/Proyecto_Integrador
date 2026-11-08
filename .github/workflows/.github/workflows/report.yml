@@ -1,0 +1,99 @@
+name: Reporte programado de ventas (CSV)
+
+on:
+  schedule:
+    # Todos los lunes a las 14:00 UTC (08:00 hora del centro de México)
+    - cron: "0 14 * * 1"
+  workflow_dispatch:        # permite generarlo a mano para la evidencia
+
+env:
+  ACCEPT_EULA: Y
+  MSSQL_PID: Developer
+  SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+  IMAGE: mcr.microsoft.com/mssql/server:2022-latest
+  CONTAINER: sqlserver
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Iniciar contenedor de SQL Server
+        run: |
+          if [ -z "$SA_PASSWORD" ]; then
+            echo "::error::Falta el secret MSSQL_SA_PASSWORD."
+            exit 1
+          fi
+          docker run -d --name "$CONTAINER" \
+            -e "ACCEPT_EULA=$ACCEPT_EULA" \
+            -e "MSSQL_PID=$MSSQL_PID" \
+            -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" \
+            -p 1433:1433 \
+            "$IMAGE"
+
+      - name: Esperar a que SQL Server acepte conexiones
+        run: |
+          if docker exec "$CONTAINER" test -x /opt/mssql-tools18/bin/sqlcmd; then
+            echo "SQLCMD=/opt/mssql-tools18/bin/sqlcmd -C" >> "$GITHUB_ENV"
+            SQLCMD="/opt/mssql-tools18/bin/sqlcmd -C"
+          else
+            echo "SQLCMD=/opt/mssql-tools/bin/sqlcmd" >> "$GITHUB_ENV"
+            SQLCMD="/opt/mssql-tools/bin/sqlcmd"
+          fi
+          for i in $(seq 1 30); do
+            if docker exec -e SQLCMDPASSWORD="$SA_PASSWORD" "$CONTAINER" \
+                 $SQLCMD -S localhost -U sa -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server listo (intento $i)."
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs "$CONTAINER"
+          exit 1
+
+      - name: Desplegar base de datos y datos de prueba
+        run: |
+          docker cp ./sql "$CONTAINER":/sql
+          for f in create_database create_tables create_procedure create_trigger test_data; do
+            echo "==> $f.sql"
+            docker exec -e SQLCMDPASSWORD="$SA_PASSWORD" "$CONTAINER" \
+              $SQLCMD -S localhost -U sa -b -f 65001 -i "/sql/$f.sql" > /dev/null
+          done
+
+      - name: Generar reporte CSV
+        run: |
+          mkdir -p reportes
+          ARCHIVO="reportes/reporte_ventas_$(date -u +%Y%m%d).csv"
+          echo "VentaID,Producto,Cantidad,FechaVenta,AuditoriaID,FechaAuditoria,ExistenciaActual" > "$ARCHIVO"
+          # -h -1 sin encabezados, -W sin espacios de relleno, -s "," separador de columnas
+          docker exec -e SQLCMDPASSWORD="$SA_PASSWORD" "$CONTAINER" \
+            $SQLCMD -S localhost -U sa -d EmpresaDB -b -f 65001 -h -1 -W -s "," -i /sql/report.sql \
+            | sed '/^\s*$/d' >> "$ARCHIVO"
+          echo "ARCHIVO=$ARCHIVO" >> "$GITHUB_ENV"
+          cat "$ARCHIVO"
+
+      - name: Resumen en la ejecución
+        run: |
+          {
+            echo "## Reporte de ventas"
+            echo ""
+            echo "Generado: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo '```csv'
+            cat "$ARCHIVO"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar CSV como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-ventas-${{ github.run_number }}
+          path: reportes/*.csv
+          retention-days: 30
+
+      - name: Detener contenedor
+        if: always()
+        run: docker rm -f "$CONTAINER" || true
